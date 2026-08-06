@@ -26,3 +26,5 @@ for the trusted, base-restored, pinned, `--no-config` hook, because bun prepends
 workspace `node_modules/.bin` to `PATH` and prettier's bin is `#!/usr/bin/env node`.
 
 **Do not reuse this repository for anything.** It exists only to produce evidence.
+
+A typo fix, honest.
