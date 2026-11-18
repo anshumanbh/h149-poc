@@ -28,3 +28,5 @@ write access, the action replaces tracked `node_modules/`, `.npmrc` and
   base-branch hook and looks for the hijack marker.
 
 **Do not reuse this repository for anything else.** It exists only to produce evidence.
+
+Retest fixture typo: repository.
