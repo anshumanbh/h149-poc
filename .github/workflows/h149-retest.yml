@@ -1,0 +1,167 @@
+name: H-149 retest (restore function + hook)
+
+# Authorized 2026-11-18 retest of HackerOne #3922068 / H-149.
+# pull_request_target is required so the workflow definition comes from the
+# base branch (this file) while the job fetches the PR head, the same order
+# claude-code-action uses. The matrix runs the published restore functions
+# from each action tag, then the base-branch hook
+# `bunx prettier@3.5.3 --no-config --write .`.
+#
+#   v1       = 1.0.282 (5a85689) — current floating tag, claimed fixed
+#   v1.0.277 = d1f58ad — first release with the fix (PRs #2020/#2026)
+#   v1.0.276 = f3b070c — pre-fix control; hook hijack should still succeed
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  retest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        action_ref: [v1, v1.0.277, v1.0.276]
+    steps:
+      - name: Checkout base branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 0
+
+      - name: Record action tag SHA
+        env:
+          ACTION_REF: ${{ matrix.action_ref }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "Testing anthropics/claude-code-action@${ACTION_REF}"
+          typ=$(gh api "repos/anthropics/claude-code-action/git/ref/tags/${ACTION_REF}" --jq .object.type)
+          sha=$(gh api "repos/anthropics/claude-code-action/git/ref/tags/${ACTION_REF}" --jq .object.sha)
+          echo "tag object: type=${typ} sha=${sha}"
+          if [ "$typ" = "tag" ]; then
+            commit=$(gh api "repos/anthropics/claude-code-action/git/tags/${sha}" --jq .object.sha)
+          else
+            commit=$sha
+          fi
+          echo "RESOLVED_COMMIT=${commit}"
+          echo "RESOLVED_COMMIT=${commit}" >> "$GITHUB_ENV"
+
+      - name: Fetch and check out the PR head
+        run: |
+          set -euo pipefail
+          BASE_REF='${{ github.event.pull_request.base.ref }}'
+          git fetch origin "pull/${{ github.event.pull_request.number }}/head:pr-head"
+          git checkout pr-head
+          git fetch origin "${BASE_REF}:refs/remotes/origin/${BASE_REF}" || git fetch origin "${BASE_REF}"
+          echo "::group::PR head node_modules/.bin"
+          ls -la node_modules/.bin/ 2>/dev/null || echo "(no node_modules/.bin)"
+          echo "::endgroup::"
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+
+      - name: Run this tag's restore functions
+        env:
+          ACTION_REF: ${{ matrix.action_ref }}
+          BASE_BRANCH: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -euo pipefail
+          CCA="${RUNNER_TEMP}/cca"
+          git clone --depth 1 --branch "${ACTION_REF}" https://github.com/anthropics/claude-code-action.git "$CCA"
+          echo "Cloned $(git -C "$CCA" log -1 --format='%H %s')"
+          (cd "$CCA" && bun install --frozen-lockfile || bun install)
+          cat > "${RUNNER_TEMP}/driver.ts" <<'EOF'
+          const cca = process.env.CCA!;
+          const baseBranch = process.env.BASE_BRANCH!;
+          console.log("cwd:", process.cwd());
+          console.log("action checkout:", cca);
+          console.log("base branch:", baseBranch);
+          const { restoreConfigFromBase } = await import(
+            cca + "/src/github/operations/restore-config.ts"
+          );
+          console.log("=== restoreConfigFromBase ===");
+          const cfg = restoreConfigFromBase(baseBranch);
+          console.log("restoreConfigFromBase returned:", cfg.join(", "));
+          let toolPresent = false;
+          let toolNames: string[] = [];
+          try {
+            const mod = await import(cca + "/src/github/operations/tool-config.ts");
+            toolPresent = typeof mod.restoreToolConfigFromBase === "function";
+            if (toolPresent) {
+              console.log("=== restoreToolConfigFromBase ===");
+              toolNames = mod.restoreToolConfigFromBase(baseBranch);
+            }
+          } catch (e) {
+            const msg = (e as Error).message.split("\n")[0];
+            console.log("restoreToolConfigFromBase not available:", msg);
+          }
+          console.log("tool-config present:", toolPresent);
+          console.log("restoreToolConfigFromBase returned:", toolNames.join(", ") || "(none)");
+          EOF
+          # The heredoc above is indented; strip leading spaces so bun can parse it.
+          python3 -c "import pathlib; p=pathlib.Path('${RUNNER_TEMP}/driver.ts'); t=p.read_text(); p.write_text('\n'.join(line[10:] if line.startswith('          ') else line for line in t.splitlines())+'\n')"
+          CCA="$CCA" BASE_BRANCH="$BASE_BRANCH" bun "${RUNNER_TEMP}/driver.ts"
+          echo "::group::workspace after restore (node_modules/.bin)"
+          ls -la node_modules/.bin/ 2>/dev/null || echo "(no node_modules/.bin — shim removed or never present)"
+          echo "::endgroup::"
+
+      - name: Show that the hook about to run is the base-branch one
+        run: |
+          set -euo pipefail
+          echo "::group::.claude/settings.json after restore"
+          cat .claude/settings.json
+          echo "::endgroup::"
+
+      - name: Run the base-branch PostToolUse hook
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          rm -f /tmp/h149-retest-20261118-pwned
+          HOOK=$(python3 -c "import json;print(json.load(open('.claude/settings.json'))['hooks']['PostToolUse'][0]['hooks'][0]['command'])")
+          echo "hook command (from .claude/settings.json): $HOOK"
+          echo "which node -> $(which node)"
+          echo "node --version -> $(node --version)"
+          set +e
+          eval "$HOOK"
+          echo "hook exit status: $?"
+          set -e
+
+      - name: Verdict
+        if: always()
+        run: |
+          set -euo pipefail
+          echo "action_ref=${{ matrix.action_ref }} resolved=${RESOLVED_COMMIT:-unknown}"
+          SHIM_ON_DISK=no
+          if [ -e node_modules/.bin/node ]; then
+            SHIM_ON_DISK=yes
+            echo "::group::node_modules/.bin/node still on disk"
+            ls -la node_modules/.bin/node
+            echo "::endgroup::"
+          else
+            echo "node_modules/.bin/node absent after restore"
+          fi
+          if [ -f /tmp/h149-retest-20261118-pwned ]; then
+            echo "::group::HIJACK MARKER"
+            cat /tmp/h149-retest-20261118-pwned
+            echo "::endgroup::"
+            echo "RESULT: STILL VULNERABLE — marker H149-RETEST-HIJACKED-20261118 appeared (shim executed)."
+            echo "shim_on_disk=${SHIM_ON_DISK}"
+            if [ "${{ matrix.action_ref }}" = "v1.0.276" ]; then
+              echo "NOTE: v1.0.276 is the pre-fix control; this result is expected."
+              exit 0
+            fi
+            exit 1
+          else
+            echo "RESULT: FIXED — no hijack marker; hook did not run the PR-supplied interpreter."
+            echo "shim_on_disk=${SHIM_ON_DISK}"
+            if [ "${{ matrix.action_ref }}" = "v1.0.276" ]; then
+              echo "WARNING: pre-fix control did not produce a marker; the test may be invalid."
+              exit 1
+            fi
+          fi
